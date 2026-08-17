@@ -197,7 +197,11 @@ def _needs_attn_tp_pynccl(server_args: ServerArgs) -> bool:
     supports_pynccl_graph = current_platform.is_cuda() or current_platform.is_rocm()
     algo = (server_args.speculative_algorithm or "").upper()
     return supports_pynccl_graph and (
-        (algo == "DSPARK" and server_args.enable_dp_attention and decode_graph_enabled)
+        (
+            algo in ("DFLASH", "DSPARK")
+            and server_args.enable_dp_attention
+            and decode_graph_enabled
+        )
         or (
             envs.SGLANG_DSA_TOPK_BROADCAST.get()
             and (

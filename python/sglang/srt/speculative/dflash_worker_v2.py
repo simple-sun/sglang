@@ -28,11 +28,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_tp import (
+    DFlashTpSync,
+    finalize_dflash_tp_decision,
+)
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
@@ -200,6 +204,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
         self._tp_group = get_tp_group()
+        parallel = get_parallel()
+        self._tp_sync = DFlashTpSync(
+            parallel.attn_tp_group
+            if server_args.enable_dp_attention
+            else parallel.tp_group
+        )
 
         bundle = build_draft_tp_worker(
             server_args=server_args,
@@ -1562,7 +1572,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
-            self._tp_group.broadcast_capture_safe(next_token_ids, src=0)
+            next_token_ids = self._tp_sync.sync(next_token_ids)
+            batch_output.next_token_ids = next_token_ids
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
@@ -1920,20 +1931,44 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_predict = torch.argmax(
                     logits_output.next_token_logits, dim=-1
                 ).view(bs, int(self.block_size))
+            simulated_commit_lens = accept_len.to(torch.int32) + 1
             apply_dflash_simulated_acceptance(
                 candidates=candidates,
                 target_predict=target_predict,
                 accept_len=accept_len,
-                commit_lens=commit_lens,
+                commit_lens=simulated_commit_lens,
                 bonus=bonus,
                 out_tokens=out_tokens,
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
             )
+            commit_lens = simulated_commit_lens
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
+
+        if self._tp_sync.enabled:
+            # Rank-local sampling may disagree. Synchronize only the authoritative
+            # decision, then derive every dependent state from rank 0's values.
+            commit_lens, new_seq_lens = finalize_dflash_tp_decision(
+                tp_sync=self._tp_sync,
+                candidates=candidates,
+                accept_len=accept_len,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                prefix_lens=prefix_lens,
+                fill_all_with_bonus=(
+                    SIMULATE_ACC_LEN > 0
+                    and SIMULATE_ACC_TOKEN_MODE != "real-draft-token"
+                ),
+                zero_uncommitted=(
+                    SIMULATE_ACC_LEN > 0
+                    and SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
+                ),
+            )
+        elif new_seq_lens is None:
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
 
         if batch.return_logprob:
             output_indices = torch.arange(
@@ -1955,8 +1990,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
             )
 
-        if new_seq_lens is None:
-            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
             on_publish(new_seq_lens)
 
