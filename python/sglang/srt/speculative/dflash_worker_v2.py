@@ -33,6 +33,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_tp import (
+    synchronize_dflash_simulated_acceptance,
+)
 from sglang.srt.speculative.dflash_utils import (
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
@@ -1931,8 +1934,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
             )
+            synchronize_dflash_simulated_acceptance(
+                tp_group=self._tp_group,
+                candidates=candidates,
+                accept_len=accept_len,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                out_tokens=out_tokens,
+                token_mode=SIMULATE_ACC_TOKEN_MODE,
+            )
             # The Triton path may have written new_seq_lens from the real
-            # accept_len; recompute it from the forced commit_lens.
+            # accept_len; recompute it from the synchronized forced commit_lens.
             new_seq_lens = None
 
         if batch.return_logprob:
