@@ -8,6 +8,8 @@ target + its DFlash draft so CI can run it on 2 GPUs (one prefill, one decode).
 import unittest
 from types import SimpleNamespace
 
+import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -51,6 +53,15 @@ class TestDisaggregationDFlash(PDDisaggregationServerBase):
         cls.extra_decode_args = spec_args
         cls.launch_all()
 
+    def _decode_avg_spec_accept_length(self) -> float:
+        resp = requests.get(self.decode_url + "/server_info", timeout=10)
+        resp.raise_for_status()
+        info = resp.json()
+        states = info.get("internal_states") or []
+        if states:
+            return float(states[0].get("avg_spec_accept_length", 0.0))
+        return 0.0
+
     def test_gsm8k(self):
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
@@ -64,6 +75,17 @@ class TestDisaggregationDFlash(PDDisaggregationServerBase):
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.74)
+
+        # DFLASH must actually speculate under PD; a value of 1.0 means it
+        # silently fell back to autoregressive decoding.
+        accept_len = self._decode_avg_spec_accept_length()
+        print(f"Decode avg_spec_accept_length: {accept_len}")
+        self.assertGreater(
+            accept_len,
+            1.0,
+            "DFLASH should accept > 1 token per verify step under PD; "
+            "a value of 1.0 indicates speculation silently fell back to AR.",
+        )
 
 
 if __name__ == "__main__":
